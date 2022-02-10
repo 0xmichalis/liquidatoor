@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"sort"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -179,6 +180,7 @@ func (l *Liquidatoor) ShortfallCheck() error {
 		return fmt.Errorf("failed multicall request: %v", err)
 	}
 
+	underwaterAccounts := make([]Account, 0)
 	for i, data := range resp.ReturnData {
 		out, err := l.getAccountLiquidityMethod.Outputs.Unpack(data)
 		if err != nil {
@@ -191,11 +193,18 @@ func (l *Liquidatoor) ShortfallCheck() error {
 			log.Printf("contract error while getting account %s liquidity: %v\n", borrowers[i], cErr)
 			continue
 		}
-		if liquidity.Cmp(shortfall) == 1 {
-			fmt.Printf("Account %s has liquidity %v\n", borrowers[i], liquidity)
-		} else {
-			fmt.Printf("Account %s is underwater by %v\n", borrowers[i], shortfall)
+		res := liquidity.Cmp(shortfall)
+		if res == -1 {
+			underwaterAccounts = append(underwaterAccounts, Account{
+				Address:   borrowers[i],
+				Shortfall: shortfall,
+			})
 		}
+	}
+	sort.Sort(ByShortfall(underwaterAccounts))
+
+	for _, acc := range underwaterAccounts {
+		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
 	}
 
 	return nil
