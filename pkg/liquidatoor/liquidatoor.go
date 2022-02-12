@@ -144,17 +144,61 @@ func New() (*Liquidatoor, error) {
 		l.LendMarkets[market.String()] = cToken
 	}
 
+	l.prettyPrintMarkets()
+
 	abi, err := abis.ComptrollerMetaData.GetAbi()
 	if err != nil {
-		return nil, fmt.Errorf("cannot get comptorller ABI: %w", err)
+		return nil, fmt.Errorf("cannot get comptroller ABI: %w", err)
 	}
 	l.getAccountLiquidityMethod = abi.Methods["getAccountLiquidity"]
 
 	return l, nil
 }
 
+func (l *Liquidatoor) prettyPrintMarkets() {
+	if len(l.LendMarkets) == 0 {
+		return
+	}
+
+	cTokenABI, err := abis.CTokenMetaData.GetAbi()
+	if err != nil {
+		log.Printf("Failed to get ctoken ABI: %v", err)
+		return
+	}
+
+	calls := []abis.MulticallCall{}
+	symbolMethod := cTokenABI.Methods["symbol"]
+
+	for address := range l.LendMarkets {
+		calls = append(calls, abis.MulticallCall{
+			Target:   common.HexToAddress(address),
+			CallData: symbolMethod.ID,
+		})
+	}
+
+	resp, err := l.Multicall.Aggregate(noOpts, calls)
+	if err != nil {
+		log.Printf("Failed multicall request to get symbols: %v", err)
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("MARKETS")
+	for i, data := range resp.ReturnData {
+		out, err := symbolMethod.Outputs.Unpack(data)
+		if err != nil {
+			log.Printf("Failed to unpack symbol output: %v", err)
+			return
+		}
+		symbol := *abi.ConvertType(out[0], new(string)).(*string)
+		fmt.Printf("- %s/address/%s (%s)\n", l.explorerURL, calls[i].Target, symbol)
+	}
+	fmt.Println()
+}
+
 func (l *Liquidatoor) ShortfallCheck() error {
 	log.Println("Starting shortfall checks...")
+	// TODO: Move GetAllBorrowers into its own goroutine
 	borrowers, err := l.Comptroller.GetAllBorrowers(noOpts)
 	if err != nil {
 		return fmt.Errorf("cannot get all borrowers: %w", err)
@@ -205,6 +249,10 @@ func (l *Liquidatoor) ShortfallCheck() error {
 
 	for _, acc := range underwaterAccounts {
 		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
+		assets, _ := l.Comptroller.GetAssetsIn(noOpts, acc.Address)
+		for i, asset := range assets {
+			fmt.Println(i, asset)
+		}
 	}
 
 	return nil
