@@ -36,6 +36,8 @@ type Liquidatoor struct {
 	BorrowMarkets map[string]*abis.CToken
 	LendMarkets   map[string]*abis.CToken
 
+	underlyingInfo map[string]UnderlyingInfo
+
 	getAccountLiquidityMethod abi.Method
 }
 
@@ -70,9 +72,10 @@ func New() (*Liquidatoor, error) {
 
 	// Instantiate liquidatoor
 	l := &Liquidatoor{
-		explorerURL:   os.Getenv("BLOCKCHAIN_EXPLORER_URL"),
-		BorrowMarkets: make(map[string]*abis.CToken),
-		LendMarkets:   make(map[string]*abis.CToken),
+		explorerURL:    os.Getenv("BLOCKCHAIN_EXPLORER_URL"),
+		BorrowMarkets:  make(map[string]*abis.CToken),
+		LendMarkets:    make(map[string]*abis.CToken),
+		underlyingInfo: make(map[string]UnderlyingInfo),
 	}
 
 	// Connect to node
@@ -143,6 +146,9 @@ func New() (*Liquidatoor, error) {
 		}
 		l.LendMarkets[market.String()] = cToken
 	}
+	if err := l.getUnderlyingInfo(); err != nil {
+		return nil, err
+	}
 
 	l.prettyPrintMarkets()
 
@@ -153,6 +159,31 @@ func New() (*Liquidatoor, error) {
 	l.getAccountLiquidityMethod = abi.Methods["getAccountLiquidity"]
 
 	return l, nil
+}
+
+func (l *Liquidatoor) getUnderlyingInfo() error {
+	for address, market := range l.LendMarkets {
+		underlying, err := market.Underlying(noOpts)
+		if err != nil {
+			return fmt.Errorf("cannot get underlying: %w", err)
+		}
+
+		erc20, err := abis.NewCToken(underlying, l.client)
+		if err != nil {
+			return fmt.Errorf("cannot get interface for underlying %s: %w", underlying, err)
+		}
+
+		name, err := erc20.Name(noOpts)
+		if err != nil {
+			return fmt.Errorf("cannot get name for underlying %s: %w", underlying, err)
+		}
+		decimals, err := erc20.Decimals(noOpts)
+		if err != nil {
+			return fmt.Errorf("cannot get decimals for underlying %s: %w", underlying, err)
+		}
+		l.underlyingInfo[address] = UnderlyingInfo{name: name, decimals: decimals}
+	}
+	return nil
 }
 
 func (l *Liquidatoor) prettyPrintMarkets() {
@@ -249,11 +280,49 @@ func (l *Liquidatoor) ShortfallCheck() error {
 
 	for _, acc := range underwaterAccounts {
 		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
+		// TODO: This should be mostly a static list; move it in the same
+		// goroutine as GetAllBorrowers.
 		assets, _ := l.Comptroller.GetAssetsIn(noOpts, acc.Address)
-		for i, asset := range assets {
-			fmt.Println(i, asset)
-		}
+		l.getAssets(acc.Address, assets)
 	}
 
 	return nil
+}
+
+func (l *Liquidatoor) getAssets(account common.Address, assets []common.Address) {
+	lentAssets := make([]*abis.CToken, 0)
+	borrowedAssets := make([]*abis.CToken, 0)
+
+	for _, asset := range assets {
+		underlyingInfo := l.underlyingInfo[asset.String()]
+		cToken, ok := l.BorrowMarkets[asset.String()]
+		if !ok {
+			cToken = l.LendMarkets[asset.String()]
+			lentAssets = append(lentAssets, cToken)
+
+			balance, err := cToken.BalanceOfUnderlying(noOpts, account)
+			if err != nil {
+				log.Printf("Failed to get underlying balance for account %s: %v", account, err)
+				return
+			}
+			sBalance := Balance{value: balance, decimals: underlyingInfo.decimals}
+			fmt.Printf("Account %s has balance %s in %s\n", account, sBalance, underlyingInfo.name)
+		} else {
+			borrowedAssets = append(borrowedAssets, cToken)
+
+			borrowed, err := cToken.BorrowBalanceStored(noOpts, account)
+			if err != nil {
+				log.Printf("Failed to get underlying balance for account %s: %v", account, err)
+				return
+			}
+			// If borrowed balance is zero here than this is an asset
+			// the user has lent instead of borrowed, sooo...
+			if borrowed.Cmp(zero) != 0 {
+				sBalance := Balance{value: borrowed, decimals: underlyingInfo.decimals}
+				fmt.Printf("Account %s has borrowed balance %s in %s\n", account, sBalance, underlyingInfo.name)
+				// Should be getting BalanceOfUnderlying
+			}
+		}
+	}
+
 }

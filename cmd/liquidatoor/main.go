@@ -14,8 +14,10 @@ func main() {
 	}
 
 	// TODO: Change to every block
-	c := time.Tick(10 * time.Second)
-	for range c {
+	if err := l.ShortfallCheck(); err != nil {
+		log.Printf("Failed to check for shortfall event: %v", err)
+	}
+	for range time.Tick(10 * time.Second) {
 		if err := l.ShortfallCheck(); err != nil {
 			log.Printf("Failed to check for shortfall event: %v", err)
 		}
