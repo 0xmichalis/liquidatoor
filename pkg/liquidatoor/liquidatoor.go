@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -43,43 +44,6 @@ type Liquidatoor struct {
 	borrowerCache         *BorrowerCache
 
 	underlyingInfo map[string]UnderlyingInfo
-}
-
-func (l *Liquidatoor) validate() error {
-	explorerURL := os.Getenv("BLOCKCHAIN_EXPLORER_URL")
-	if explorerURL == "" {
-		return errors.New("BLOCKCHAIN_EXPLORER_URL cannot be empty")
-	}
-	l.explorerURL = explorerURL
-
-	if os.Getenv("BORROWER_CACHE_INTERVAL") == "" {
-		return errors.New("BORROWER_CACHE_INTERVAL cannot be empty")
-	}
-	borrowerCacheInterval, err := time.ParseDuration(os.Getenv("BORROWER_CACHE_INTERVAL"))
-	if err != nil {
-		return err
-	}
-	l.borrowerCacheInterval = borrowerCacheInterval
-
-	comptrollerAddress := os.Getenv("COMPTROLLER_ADDRESS")
-	if comptrollerAddress == "" {
-		return errors.New("COMPTROLLER_ADDRESS cannot be empty")
-	}
-	l.comptrollerAddress = common.HexToAddress(comptrollerAddress)
-
-	if os.Getenv("PRIVATE_KEY") == "" {
-		return errors.New("PRIVATE_KEY cannot be empty")
-	}
-
-	if os.Getenv("MULTICALL_ADDRESS") == "" {
-		return errors.New("MULTICALL_ADDRESS cannot be empty")
-	}
-
-	if os.Getenv("NODE_API_URL") == "" {
-		return errors.New("NODE_API_URL cannot be empty")
-	}
-
-	return nil
 }
 
 var (
@@ -187,6 +151,43 @@ func New() (*Liquidatoor, error) {
 	return l, nil
 }
 
+func (l *Liquidatoor) validate() error {
+	explorerURL := os.Getenv("BLOCKCHAIN_EXPLORER_URL")
+	if explorerURL == "" {
+		return errors.New("BLOCKCHAIN_EXPLORER_URL cannot be empty")
+	}
+	l.explorerURL = explorerURL
+
+	if os.Getenv("BORROWER_CACHE_INTERVAL") == "" {
+		return errors.New("BORROWER_CACHE_INTERVAL cannot be empty")
+	}
+	borrowerCacheInterval, err := time.ParseDuration(os.Getenv("BORROWER_CACHE_INTERVAL"))
+	if err != nil {
+		return err
+	}
+	l.borrowerCacheInterval = borrowerCacheInterval
+
+	comptrollerAddress := os.Getenv("COMPTROLLER_ADDRESS")
+	if comptrollerAddress == "" {
+		return errors.New("COMPTROLLER_ADDRESS cannot be empty")
+	}
+	l.comptrollerAddress = common.HexToAddress(comptrollerAddress)
+
+	if os.Getenv("PRIVATE_KEY") == "" {
+		return errors.New("PRIVATE_KEY cannot be empty")
+	}
+
+	if os.Getenv("MULTICALL_ADDRESS") == "" {
+		return errors.New("MULTICALL_ADDRESS cannot be empty")
+	}
+
+	if os.Getenv("NODE_API_URL") == "" {
+		return errors.New("NODE_API_URL cannot be empty")
+	}
+
+	return nil
+}
+
 func (l *Liquidatoor) getAccountLiquidityMethod() abi.Method {
 	return l.comptrollerABI.Methods["getAccountLiquidity"]
 }
@@ -257,6 +258,29 @@ func (l *Liquidatoor) prettyPrintMarkets() {
 	fmt.Println()
 }
 
+func (l *Liquidatoor) SubscribeToBlocks() {
+	headers := make(chan *types.Header)
+	sub, err := l.client.SubscribeNewHead(context.Background(), headers)
+	if err != nil {
+		log.Fatalf("Failed to subscribe to headers: %v", err)
+	}
+
+	for {
+		select {
+		case err := <-sub.Err():
+			log.Printf("Got subscription error: %v", err)
+
+		case header := <-headers:
+			log.Printf("Processing block %d", header.Number.Uint64())
+
+			// TODO: Avoid processing when in-flight check is in progress
+			if err := l.ShortfallCheck(); err != nil {
+				log.Printf("Failed shortfall check: %v", err)
+			}
+		}
+	}
+}
+
 func (l *Liquidatoor) ShortfallCheck() error {
 	log.Println("Starting shortfall checks...")
 
@@ -316,6 +340,8 @@ func (l *Liquidatoor) ShortfallCheck() error {
 
 	for _, acc := range underwaterAccounts {
 		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
+		// TODO: Check whether it is worth to execute liquidation
+		// liquidateCalculateSeizeTokens
 		l.getAssets(acc.Address, acc.Assets)
 	}
 
