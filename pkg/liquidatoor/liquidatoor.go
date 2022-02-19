@@ -46,7 +46,6 @@ type Liquidatoor struct {
 }
 
 func (l *Liquidatoor) validate() error {
-	// comptrollerAddress: common.HexToAddress(os.Getenv("COMPTROLLER_ADDRESS")),
 	explorerURL := os.Getenv("BLOCKCHAIN_EXPLORER_URL")
 	if explorerURL == "" {
 		return errors.New("BLOCKCHAIN_EXPLORER_URL cannot be empty")
@@ -71,12 +70,15 @@ func (l *Liquidatoor) validate() error {
 	if os.Getenv("PRIVATE_KEY") == "" {
 		return errors.New("PRIVATE_KEY cannot be empty")
 	}
+
 	if os.Getenv("MULTICALL_ADDRESS") == "" {
 		return errors.New("MULTICALL_ADDRESS cannot be empty")
 	}
+
 	if os.Getenv("NODE_API_URL") == "" {
 		return errors.New("NODE_API_URL cannot be empty")
 	}
+
 	return nil
 }
 
@@ -152,9 +154,6 @@ func New() (*Liquidatoor, error) {
 	}
 	l.comptrollerABI = abi
 
-	// Start borrower cache
-	l.borrowerCache = NewBorrowerCache(l.borrowerCacheInterval, multicall, comptroller, abi)
-
 	// Instantiate markets
 	markets, err := comptroller.GetAllMarkets(noOpts)
 	if err != nil {
@@ -182,6 +181,7 @@ func New() (*Liquidatoor, error) {
 	l.prettyPrintMarkets()
 
 	// Start borrower cache in a separate thread
+	l.borrowerCache = NewBorrowerCache(l.borrowerCacheInterval, multicall, comptroller, abi)
 	go l.borrowerCache.Init()
 
 	return l, nil
@@ -265,10 +265,11 @@ func (l *Liquidatoor) ShortfallCheck() error {
 
 	if len(borrowers) == 0 {
 		// Ignore if the cache is not primed yet
-		log.Println("Empty borrower cache.")
+		log.Println("Empty borrower cache; aborting shortfall check")
 		return nil
 	}
 
+	// Fetch all borrowers liquidity
 	calls := []abis.MulticallCall{}
 	id := l.getAccountLiquidityMethod().ID
 
@@ -288,6 +289,7 @@ func (l *Liquidatoor) ShortfallCheck() error {
 		return fmt.Errorf("failed multicall request: %v", err)
 	}
 
+	// Filter underwater accounts
 	underwaterAccounts := make([]Borrower, 0)
 	for i, data := range resp.ReturnData {
 		out, err := l.getAccountLiquidityMethod().Outputs.Unpack(data)
@@ -316,6 +318,8 @@ func (l *Liquidatoor) ShortfallCheck() error {
 		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
 		l.getAssets(acc.Address, acc.Assets)
 	}
+
+	log.Println("Shortfall check complete.")
 
 	return nil
 }
