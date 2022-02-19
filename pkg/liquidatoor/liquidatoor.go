@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -31,23 +32,42 @@ type Liquidatoor struct {
 	TxOpts *bind.TransactOpts
 
 	// Contracts
-	Multicall     *abis.Multicall
-	Comptroller   *abis.Comptroller
-	BorrowMarkets map[string]*abis.CToken
-	LendMarkets   map[string]*abis.CToken
+	Multicall          *abis.Multicall
+	Comptroller        *abis.Comptroller
+	BorrowMarkets      map[string]*abis.CToken
+	LendMarkets        map[string]*abis.CToken
+	comptrollerAddress common.Address
+	comptrollerABI     *abi.ABI
+
+	borrowerCacheInterval time.Duration
+	borrowerCache         *BorrowerCache
 
 	underlyingInfo map[string]UnderlyingInfo
-
-	getAccountLiquidityMethod abi.Method
 }
 
-func validate() error {
-	if os.Getenv("BLOCKCHAIN_EXPLORER_URL") == "" {
+func (l *Liquidatoor) validate() error {
+	// comptrollerAddress: common.HexToAddress(os.Getenv("COMPTROLLER_ADDRESS")),
+	explorerURL := os.Getenv("BLOCKCHAIN_EXPLORER_URL")
+	if explorerURL == "" {
 		return errors.New("BLOCKCHAIN_EXPLORER_URL cannot be empty")
 	}
-	if os.Getenv("COMPTROLLER_ADDRESS") == "" {
+	l.explorerURL = explorerURL
+
+	if os.Getenv("BORROWER_CACHE_INTERVAL") == "" {
+		return errors.New("BORROWER_CACHE_INTERVAL cannot be empty")
+	}
+	borrowerCacheInterval, err := time.ParseDuration(os.Getenv("BORROWER_CACHE_INTERVAL"))
+	if err != nil {
+		return err
+	}
+	l.borrowerCacheInterval = borrowerCacheInterval
+
+	comptrollerAddress := os.Getenv("COMPTROLLER_ADDRESS")
+	if comptrollerAddress == "" {
 		return errors.New("COMPTROLLER_ADDRESS cannot be empty")
 	}
+	l.comptrollerAddress = common.HexToAddress(comptrollerAddress)
+
 	if os.Getenv("PRIVATE_KEY") == "" {
 		return errors.New("PRIVATE_KEY cannot be empty")
 	}
@@ -66,16 +86,16 @@ var (
 )
 
 func New() (*Liquidatoor, error) {
-	if err := validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-
 	// Instantiate liquidatoor
 	l := &Liquidatoor{
-		explorerURL:    os.Getenv("BLOCKCHAIN_EXPLORER_URL"),
 		BorrowMarkets:  make(map[string]*abis.CToken),
 		LendMarkets:    make(map[string]*abis.CToken),
 		underlyingInfo: make(map[string]UnderlyingInfo),
+	}
+
+	// Run validations
+	if err := l.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	// Connect to node
@@ -120,11 +140,20 @@ func New() (*Liquidatoor, error) {
 	l.Multicall = multicall
 
 	// Instantiate comptroller
-	comptroller, err := abis.NewComptroller(common.HexToAddress(os.Getenv("COMPTROLLER_ADDRESS")), client)
+	comptroller, err := abis.NewComptroller(l.comptrollerAddress, client)
 	if err != nil {
 		return nil, fmt.Errorf("cannot instantiate comptroller: %w", err)
 	}
 	l.Comptroller = comptroller
+
+	abi, err := abis.ComptrollerMetaData.GetAbi()
+	if err != nil {
+		return nil, fmt.Errorf("cannot get comptroller ABI: %w", err)
+	}
+	l.comptrollerABI = abi
+
+	// Start borrower cache
+	l.borrowerCache = NewBorrowerCache(l.borrowerCacheInterval, multicall, comptroller, abi)
 
 	// Instantiate markets
 	markets, err := comptroller.GetAllMarkets(noOpts)
@@ -152,13 +181,14 @@ func New() (*Liquidatoor, error) {
 
 	l.prettyPrintMarkets()
 
-	abi, err := abis.ComptrollerMetaData.GetAbi()
-	if err != nil {
-		return nil, fmt.Errorf("cannot get comptroller ABI: %w", err)
-	}
-	l.getAccountLiquidityMethod = abi.Methods["getAccountLiquidity"]
+	// Start borrower cache in a separate thread
+	go l.borrowerCache.Init()
 
 	return l, nil
+}
+
+func (l *Liquidatoor) getAccountLiquidityMethod() abi.Method {
+	return l.comptrollerABI.Methods["getAccountLiquidity"]
 }
 
 func (l *Liquidatoor) getUnderlyingInfo() error {
@@ -229,23 +259,26 @@ func (l *Liquidatoor) prettyPrintMarkets() {
 
 func (l *Liquidatoor) ShortfallCheck() error {
 	log.Println("Starting shortfall checks...")
-	// TODO: Move GetAllBorrowers into its own goroutine
-	borrowers, err := l.Comptroller.GetAllBorrowers(noOpts)
-	if err != nil {
-		return fmt.Errorf("cannot get all borrowers: %w", err)
+
+	borrowers := l.borrowerCache.Read()
+	log.Printf("Number of borrowers: %d", len(borrowers))
+
+	if len(borrowers) == 0 {
+		// Ignore if the cache is not primed yet
+		log.Println("Empty borrower cache.")
+		return nil
 	}
-	fmt.Println("Number of borrowers:", len(borrowers))
 
 	calls := []abis.MulticallCall{}
-	id := l.getAccountLiquidityMethod.ID
+	id := l.getAccountLiquidityMethod().ID
 
 	for _, borrower := range borrowers {
-		inputs, err := l.getAccountLiquidityMethod.Inputs.Pack(borrower)
+		inputs, err := l.getAccountLiquidityMethod().Inputs.Pack(borrower.Address)
 		if err != nil {
 			return fmt.Errorf("cannot pack borrower: %w", err)
 		}
 		calls = append(calls, abis.MulticallCall{
-			Target:   common.HexToAddress(os.Getenv("COMPTROLLER_ADDRESS")),
+			Target:   l.comptrollerAddress,
 			CallData: append(id[:], inputs[:]...),
 		})
 	}
@@ -255,9 +288,9 @@ func (l *Liquidatoor) ShortfallCheck() error {
 		return fmt.Errorf("failed multicall request: %v", err)
 	}
 
-	underwaterAccounts := make([]Account, 0)
+	underwaterAccounts := make([]Borrower, 0)
 	for i, data := range resp.ReturnData {
-		out, err := l.getAccountLiquidityMethod.Outputs.Unpack(data)
+		out, err := l.getAccountLiquidityMethod().Outputs.Unpack(data)
 		if err != nil {
 			return fmt.Errorf("cannot unpack output: %v", err)
 		}
@@ -270,8 +303,9 @@ func (l *Liquidatoor) ShortfallCheck() error {
 		}
 		res := liquidity.Cmp(shortfall)
 		if res == -1 {
-			underwaterAccounts = append(underwaterAccounts, Account{
-				Address:   borrowers[i],
+			underwaterAccounts = append(underwaterAccounts, Borrower{
+				Address:   borrowers[i].Address,
+				Assets:    borrowers[i].Assets,
 				Shortfall: shortfall,
 			})
 		}
@@ -280,10 +314,7 @@ func (l *Liquidatoor) ShortfallCheck() error {
 
 	for _, acc := range underwaterAccounts {
 		fmt.Printf("Account %s is underwater by %v\n", acc.Address, acc.Shortfall)
-		// TODO: This should be mostly a static list; move it in the same
-		// goroutine as GetAllBorrowers.
-		assets, _ := l.Comptroller.GetAssetsIn(noOpts, acc.Address)
-		l.getAssets(acc.Address, assets)
+		l.getAssets(acc.Address, acc.Assets)
 	}
 
 	return nil
@@ -294,10 +325,12 @@ func (l *Liquidatoor) getAssets(account common.Address, assets []common.Address)
 	borrowedAssets := make([]*abis.CToken, 0)
 
 	for _, asset := range assets {
-		underlyingInfo := l.underlyingInfo[asset.String()]
-		cToken, ok := l.BorrowMarkets[asset.String()]
+		address := asset.String()
+
+		underlyingInfo := l.underlyingInfo[address]
+		cToken, ok := l.BorrowMarkets[address]
 		if !ok {
-			cToken = l.LendMarkets[asset.String()]
+			cToken = l.LendMarkets[address]
 			lentAssets = append(lentAssets, cToken)
 
 			balance, err := cToken.BalanceOfUnderlying(noOpts, account)
