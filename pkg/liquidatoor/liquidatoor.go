@@ -35,6 +35,7 @@ type Liquidatoor struct {
 	// Contracts
 	Multicall          *abis.Multicall
 	Comptroller        *abis.Comptroller
+	Oracle             *abis.PriceOracle
 	BorrowMarkets      map[string]*abis.CToken
 	LendMarkets        map[string]*abis.CToken
 	comptrollerAddress common.Address
@@ -65,6 +66,7 @@ func New() (*Liquidatoor, error) {
 	}
 
 	// Connect to node
+	// TODO: Make timeout configurable
 	client, err := ethclient.Dial(os.Getenv("NODE_API_URL"))
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to node: %w", err)
@@ -90,7 +92,7 @@ func New() (*Liquidatoor, error) {
 		return nil, fmt.Errorf("cannot cast public key to ECDSA")
 	}
 	address := crypto.PubkeyToAddress(*publicKeyECDSA)
-	fmt.Println("Address:", address)
+	fmt.Printf("Liquidatoor address: %s/address/%s\n", l.explorerURL, address)
 
 	txOpts, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
 	if err != nil {
@@ -111,6 +113,15 @@ func New() (*Liquidatoor, error) {
 		return nil, fmt.Errorf("cannot instantiate comptroller: %w", err)
 	}
 	l.Comptroller = comptroller
+
+	oracle, err := comptroller.Oracle(noOpts)
+	if err != nil {
+		return nil, fmt.Errorf("cannot fetch price oracle: %w", err)
+	}
+	l.Oracle, err = abis.NewPriceOracle(oracle, client)
+	if err != nil {
+		return nil, fmt.Errorf("cannot instantiate price oracle: %w", err)
+	}
 
 	abi, err := abis.ComptrollerMetaData.GetAbi()
 	if err != nil {
@@ -228,13 +239,31 @@ func (l *Liquidatoor) prettyPrintMarkets() {
 		return
 	}
 
+	priceOracleABI, err := abis.PriceOracleMetaData.GetAbi()
+	if err != nil {
+		log.Printf("Failed to get price oracle ABI: %v", err)
+		return
+	}
+
 	calls := []abis.MulticallCall{}
 	symbolMethod := cTokenABI.Methods["symbol"]
+	getPriceMethod := priceOracleABI.Methods["getUnderlyingPrice"]
+
+	oracle, _ := l.Comptroller.Oracle(noOpts)
 
 	for address := range l.LendMarkets {
 		calls = append(calls, abis.MulticallCall{
 			Target:   common.HexToAddress(address),
 			CallData: symbolMethod.ID,
+		})
+		inputs, err := getPriceMethod.Inputs.Pack(common.HexToAddress(address))
+		if err != nil {
+			log.Printf("cannot pack cToken: %v", err)
+			return
+		}
+		calls = append(calls, abis.MulticallCall{
+			Target:   oracle,
+			CallData: append(getPriceMethod.ID[:], inputs[:]...),
 		})
 	}
 
@@ -247,13 +276,23 @@ func (l *Liquidatoor) prettyPrintMarkets() {
 	fmt.Println()
 	fmt.Println("MARKETS")
 	for i, data := range resp.ReturnData {
-		out, err := symbolMethod.Outputs.Unpack(data)
-		if err != nil {
-			log.Printf("Failed to unpack symbol output: %v", err)
-			return
+		if i%2 == 0 {
+			out, err := symbolMethod.Outputs.Unpack(data)
+			if err != nil {
+				log.Printf("Failed to unpack symbol output: %v", err)
+				return
+			}
+			symbol := *abi.ConvertType(out[0], new(string)).(*string)
+			fmt.Printf("- %s/address/%s (%s)\n", l.explorerURL, calls[i].Target, symbol)
+		} else {
+			out, err := getPriceMethod.Outputs.Unpack(data)
+			if err != nil {
+				log.Printf("Failed to unpack price output: %v", err)
+				return
+			}
+			price := *abi.ConvertType(out[0], new(*big.Int)).(**big.Int)
+			fmt.Printf("  Price: %v\n", price)
 		}
-		symbol := *abi.ConvertType(out[0], new(string)).(*string)
-		fmt.Printf("- %s/address/%s (%s)\n", l.explorerURL, calls[i].Target, symbol)
 	}
 	fmt.Println()
 }
